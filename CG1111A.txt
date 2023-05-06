@@ -1,0 +1,769 @@
+#include "MeMCore.h"
+
+/******************************\
+| CONSTANTS AND INSTANTIATIONS | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+\******************************/
+
+// Motor and movement
+const MeDCMotor leftMotor(M1);               // Assign leftMotor to port M1.
+const MeDCMotor rightMotor(M2);              // Assign rightMotor to port M2.
+const uint16_t MOTOR_SPEED_R = 176;          // Default speed of left motor when moving forward. Ranges from 0 to 255. 176
+const uint16_t MOTOR_SPEED_L = 190;          // Default speed of right motor when moving forward. Ranges from 0 to 255. 190
+const uint16_t TURN_SPEED = 170;             // Default speed when making turns. Ranges from 0 to 255.
+const uint16_t TURN_TIME_90_DEG = 475;       // Duration (ms) for turning.
+const uint16_t TURN_TIME_180_DEG = 850;      // Duration (ms) for 180 turn.
+const uint16_t TURN_TIME_SUCC = 485;         // Duration (ms) for successive turns.
+const uint16_t WAIT_TIME_AFTER_TURN = 1000;  // Wait duration (ms) after a turn to stabilise mBot.
+const uint16_t WAIT_TIME_AFTER_MOVE = 500;   // Wait duration (ms) after moving forward to stabilise mBot.
+const uint16_t MOVE_TIME_ONE_TILE = 1000;    // Move duration (ms) for bot to move distance of one tile.
+
+// Infrared subsystem
+#define INFRARED A2
+
+// Ultrasonic sensor
+const int TIMEOUT = 2000;            // Max microseconds to wait; choose according to max distance of wall (currently 5 cm).
+const float SPEED_OF_SOUND = 0.034;  // In cm/microsecs, update according to experiment.
+const int ULTRASONIC = 12;
+
+// Black line sensor
+const MeLineFollower lineFinder(PORT_2);  // Assign lineFinder to RJ25 port 2
+
+// Push button
+#define PUSH_BUTTON A7
+
+// Colour sensor
+const int RGB_WAIT = 200;     // Wait duration (ms) after LED turns ON so LDR voltage stabilises before it's read.
+const int LDR_WAIT = 10;      // Time interval (ms) in between LDR readings in getAvgLdrReading.
+#define TWO_TO_FOUR_B_PIN A0  // S1 pin of RJ25 at port 4.
+#define TWO_TO_FOUR_A_PIN A1  // S2 pin of RJ25 at port 4.
+#define IR_SENSOR_PIN A2      // S1 pin of RJ25 at port 3.
+#define LDR_SENSOR_PIN A3     // S2 pin of RJ25 at port 3.
+const String RED_PIN = "Y0";  // Output pin of 2-to-4 chip.
+const String Y0 = RED_PIN;
+const String GREEN_PIN = "Y1";  // Output pin of 2-to-4 chip.
+const String Y1 = GREEN_PIN;
+const String BLUE_PIN = "Y2";  // Output pin of 2-to-4 chip.
+const String Y2 = BLUE_PIN;
+const String IR_EMITTER_PIN = "Y3";  // Output pin of 2-to-4 chip.
+const String Y3 = IR_EMITTER_PIN;
+// Experimental raw values from LDR when sensing black and white surfaces.
+// We use these in detectColour to normalise LDR readings.
+const int MIN_RAW_RED = 328;
+const int MIN_RAW_GREEN = 616;
+const int MIN_RAW_BLUE = 639;
+const int MAX_RAW_RED = 848;
+const int MAX_RAW_GREEN = 931;
+const int MAX_RAW_BLUE = 921;
+// Experimental raw values of hue and luminosity ranges of each colour.
+// We use these in categoriseColour.
+const float HUE_MIN_RED = 0.00;
+const float HUE_MAX_RED = 18.00;
+const float HUE_MIN_GREEN = 100.00;
+const float HUE_MAX_GREEN = 175.00;
+const float HUE_MIN_ORANGE = 18.00;
+const float HUE_MAX_ORANGE = 100.00;
+const float HUE_MIN_PURPLE = 240.00;
+const float HUE_MAX_PURPLE = 360.00;
+const float HUE_MIN_BLUE = 175.00;
+const float HUE_MAX_BLUE = 240.00;
+const float LUM_MIN_WHITE = 0.95;
+// Return values of detectColour. All possible colours detectable.
+enum Colour { C_RED,     // 🔴
+              C_GREEN,   // 🟢
+              C_ORANGE,  // 🟠
+              C_PURPLE,  // 🟣
+              C_BLUE,    // 🔵
+              C_WHITE    // ⚪
+};
+
+// mBot RGB LED
+MeRGBLed led(0, 30);
+
+// State management
+enum Status { STOPPED = 0,    // mBot stops all actions, waits for status to change.
+              RUNNING = 1,    // mBot is solving the maze, it navigates maze and solves waypoint challenges.
+              COMPLETED = 2,  // mBot has reached the end of the maze, it stops and plays music.
+};
+Status status = RUNNING;        // Global mutable status flag. Main loop reads and updates mBot status to determine action. Default RUNNING.
+bool isPushButtonDown = false;  // Push button status flag. If down, main loop checks for button release; if not down, main loop checks for button pushes. Default down.
+
+/******************************\
+| MOTOR AND MOVEMENT FUNCTIONS | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+\******************************/
+
+void spinLeftWheelForward(int16_t speed);
+void spinLeftWheelBackward(int16_t speed);
+void spinRightWheelForward(int16_t speed);
+void spinRightWheelBackward(int16_t speed);
+
+// Turns mBot to the right by 90 degrees (on the spot).
+// 🟢 Called when GREEN detected at waypoint.
+// Parameters are optional and used for testing.
+void turnRight(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_90_DEG) {
+  // Spin left motor forward and right motor backward to turn mBot to the right.
+  spinLeftWheelForward(turnSpeed);
+  spinRightWheelBackward(turnSpeed);
+  delay(turnTime);  // Keep turning until turn is 90 degrees.
+
+  // After turn, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_TURN);
+}
+
+// Turns mBot to the left by 90 degrees (on the spot).
+// 🔴 Called when RED detected at waypoint.
+// Parameters are optional and used for testing.
+void turnLeft(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_90_DEG) {
+  // Spin left motor backward and right motor forward to turn mBot to the left.
+  spinLeftWheelBackward(turnSpeed);
+  spinRightWheelForward(turnSpeed);
+  delay(turnTime - 10);  // Keep turning until turn is 90 degrees.
+
+  // After turn, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_TURN);
+}
+
+// Turns mBot by 180 degrees to the left (on the spot).
+// 🟠 Called when ORANGE detected at waypoint when closer to right wall.
+// Parameters are optional and used for testing.
+void turn180Left(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_180_DEG) {
+  // Turn mBot 180 degrees by spinning to the left.
+  // Spin left motor backward and right motor forward to turn mBot to the left.
+  spinLeftWheelBackward(turnSpeed);
+  spinRightWheelForward(turnSpeed);
+  delay(turnTime);  // Keep turning until turn is 180 degrees.
+
+  // After turn, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_TURN);
+}
+
+// Turns mBot by 180 degrees to the right (on the spot).
+// 🟠 Called when ORANGE detected at waypoint when closer to left wall.
+// Parameters are optional and used for testing.
+void turn180Right(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_180_DEG) {
+  // Turn mBot 180 degrees by spinning to the left.
+  // Spin left motor backward and right motor forward to turn mBot to the left.
+  spinLeftWheelBackward(-turnSpeed);
+  spinRightWheelForward(-turnSpeed);
+  delay(turnTime);  // Keep turning until turn is 180 degrees.
+
+  // After turn, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_TURN);
+}
+
+// Turns mBot to the left two times successively.
+// 🟣 Called when PURPLE detected at waypoint.
+// Parameters are optional and used for testing.
+void turnLeftThenLeft(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_SUCC) {
+  // 1. Turn mBot to the left by 90 degrees.
+  turnLeft(turnSpeed, turnTime - 15);
+
+  // 2. Then, move mBot forward by one tile.
+  spinLeftWheelForward(MOTOR_SPEED_L);
+  spinRightWheelForward(MOTOR_SPEED_R);
+  delay(MOVE_TIME_ONE_TILE - 0);  // TODO: EDIT VALUE BASED ON LAB VALUES.
+
+  // 3. After moving forward, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_MOVE);
+
+  // 4. Finally, turn mBot to the left by 90 degrees again.
+  turnLeft(turnSpeed, turnTime - 35);
+}
+
+// Turns mBot to the right two times successively.
+// 🔵 Called when BLUE detected at waypoint.
+// Parameters are optional and used for testing.
+void turnRightThenRight(uint16_t turnSpeed = TURN_SPEED, uint16_t turnTime = TURN_TIME_SUCC) {
+  // 1. Turn mBot to the right by 90 degrees.
+  turnRight(turnSpeed, turnTime - 20);
+
+  // 2. Then, move mBot forward by one tile.
+  spinLeftWheelForward(MOTOR_SPEED_L);
+  spinRightWheelForward(MOTOR_SPEED_R);
+  delay(MOVE_TIME_ONE_TILE);  // TODO: EDIT VALUE BASED ON LAB VALUES.
+
+  // 3. After moving forward, stop motors and wait for a short duration for mBot to stabilise.
+  leftMotor.stop();
+  rightMotor.stop();
+  delay(WAIT_TIME_AFTER_MOVE);
+
+  // 4. Finally, turn mBot to the right by 90 degrees again.
+  turnRight(turnSpeed, turnTime - 45);
+}
+
+// Wrapper function to spin left wheel forward (anti-clockwise).
+void spinLeftWheelForward(int16_t speed) {
+  leftMotor.run(-speed);
+}
+
+// Wrapper function to spin left wheel backward (clockwise).
+void spinLeftWheelBackward(int16_t speed) {
+  leftMotor.run(speed);
+}
+
+// Wrapper function to spin right wheel forward (clockwise).
+void spinRightWheelForward(int16_t speed) {
+  rightMotor.run(speed);
+}
+
+// Wrapper function to spin right wheel backward (anti-clockwise).
+void spinRightWheelBackward(int16_t speed) {
+  rightMotor.run(-speed);
+}
+
+/*********************************\
+| COLOUR SENSOR SUBUNIT FUNCTIONS | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+\*********************************/
+
+// Function declations
+void activateOutputPin(int pin);
+int getAvgLdrReading(int times = 5);
+Colour detectColour();
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max);
+float calcHue(float r, float g, float b);
+float calcLum(float r, float g, float b);
+Colour categoriseColour(float hue, float lum);
+
+// Called when waypoint reached.
+// Returns predicted colour.
+Colour detectColour() {
+  // Get average readings from LDR when each RGB is on.
+  activateOutputPin(RED_PIN);  // Turn on Red LED.
+  delay(RGB_WAIT);
+  int rawRed = getAvgLdrReading();
+
+  activateOutputPin(GREEN_PIN);  // Turns on Green LED.
+  delay(RGB_WAIT);
+  int rawGreen = getAvgLdrReading();
+
+  activateOutputPin(BLUE_PIN);  // Turns on Blue LED.
+  delay(RGB_WAIT);
+  int rawBlue = getAvgLdrReading();
+
+  activateOutputPin(RED_PIN);  // Turns off LEDs. Turns on IR emitter.
+
+  // Normalise readings to a 0-1 scale.
+  float normRed = mapFloat(rawRed, MIN_RAW_RED, MAX_RAW_RED, 0.0, 1.0);
+  float normGreen = mapFloat(rawGreen, MIN_RAW_GREEN, MAX_RAW_GREEN, 0.0, 1.0);
+  float normBlue = mapFloat(rawBlue, MIN_RAW_BLUE, MAX_RAW_BLUE, 0.0, 1.0);
+
+  // Calculate hue and luminosity.
+  float hue = calcHue(normRed, normGreen, normBlue);
+  float lum = calcLum(normRed, normGreen, normBlue);
+
+  // Categorise colour from hue and luminosity values.
+  return categoriseColour(hue, lum);
+}
+
+// Takes a value x, constrained within the range in_min to in_max,
+// and outputs the value mapped to the range out_min to out_max.
+// Similar to the native map() function but works with floats instead of longs.
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (constrain(x, in_min, in_max) - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// Accepts red, green, and blue intensity values normalised to 0-1 scale
+// and outputs hue value normalised to 0-360 scale.
+float calcHue(float r, float g, float b) {
+  float min = min(min(r, g), b);
+  float max = max(max(r, g), b);
+  if (min == max) {
+    return 0.0;
+  }
+
+  float hue = 0.0;
+  if (max == r) {
+    hue = (g - b) / (max - min);
+  } else if (max == g) {
+    hue = 2.0 + (b - r) / (max - min);
+  } else if (max == b) {
+    hue = 4.0 + (r - g) / (max - min);
+  }
+
+  hue *= 60;
+  return hue < 0 ? hue + 360 : hue;
+}
+
+// Accepts red, green, blue intensity values normalised to 0-1 scale
+// and outputs luminosity value which ranges from 0-1.
+float calcLum(float r, float g, float b) {
+  // If this formula not sufficient, try the more robust method from
+  // https://stackoverflow.com/a/56678483/13432136.
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// Accepts hue and luminosity values and returns predicted colour.
+Colour categoriseColour(float hue, float lum) {
+  // If the luminosity passes threshold, colour should be white,
+  // because white should be the brightest colour.
+  if (lum > LUM_MIN_WHITE) {
+    led.setColor(255, 255, 255);
+    led.show();
+    return C_WHITE;
+  }
+
+  // Each colour has a predetermined experimental hue range.
+  // If hue calculated is within the range of a colour,
+  // then we predict the colour observed correspondingly.
+  if (hue > HUE_MIN_RED && hue <= HUE_MAX_RED) {
+    led.setColor(255, 0, 0);
+    led.show();
+    return C_RED;
+  }
+  if (hue > HUE_MIN_GREEN && hue <= HUE_MAX_GREEN) {
+    led.setColor(0, 255, 0);
+    led.show();
+    return C_GREEN;
+  }
+  if (hue > HUE_MIN_ORANGE && hue <= HUE_MAX_ORANGE) {
+    led.setColor(255, 120, 0);
+    led.show();
+    return C_ORANGE;
+  }
+  if (hue > HUE_MIN_PURPLE && hue <= HUE_MAX_PURPLE) {
+    led.setColor(255, 0, 255);
+    led.show();
+    return C_PURPLE;
+  }
+  if (hue > HUE_MIN_BLUE && hue <= HUE_MAX_BLUE) {
+    led.setColor(0, 255, 255);
+    led.show();
+    return C_BLUE;
+  } else {
+    Serial.print("ERROR: Could not categorise colour with ");
+    Serial.print("hue=");
+    Serial.print(hue);
+    Serial.print(", lum=");
+    Serial.println(lum);
+    return C_RED;
+  }
+}
+
+// Accepts Y0, Y1, Y2, or Y3 or RED_PIN, GREEN_PIN, BLUE_PIN, IR_EMITTER_PIN.
+// Then writes to TWO_TO_FOUR_A_PIN and TWO_TO_FOUR_B_PIN
+// such that the specified pin will be enabled (logic LOW).
+void activateOutputPin(String pin) {
+  if (pin == Y0) {
+    digitalWrite(TWO_TO_FOUR_A_PIN, LOW);
+    digitalWrite(TWO_TO_FOUR_B_PIN, LOW);
+    Serial.println("RED should turn on");
+  } else if (pin == Y1) {
+    digitalWrite(TWO_TO_FOUR_A_PIN, HIGH);
+    digitalWrite(TWO_TO_FOUR_B_PIN, LOW);
+    Serial.println("GREEN should turn on");
+  } else if (pin == Y2) {
+    digitalWrite(TWO_TO_FOUR_A_PIN, LOW);
+    digitalWrite(TWO_TO_FOUR_B_PIN, HIGH);
+    Serial.println("BLUE should turn on");
+  } else if (pin == Y3) {
+    digitalWrite(TWO_TO_FOUR_A_PIN, HIGH);
+    digitalWrite(TWO_TO_FOUR_B_PIN, HIGH);
+  } else {
+    Serial.print("ERROR: Invalid pin number: ");
+    Serial.println(pin);
+  }
+}
+
+// Finds the average reading of LDR for the requested number of times.
+int getAvgLdrReading(int times = 5) {
+  int total = 0.0;
+
+  // Take reading for the number of times passed into function.
+  for (int i = 0; i < times; i++) {
+    total += analogRead(LDR_SENSOR_PIN);  // analogRead() returns ints 0-1023
+    delay(LDR_WAIT);
+  }
+
+  return total / times;
+}
+
+/******************************\ 
+| INITIALISATION AND MAIN LOOP | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+\******************************/
+
+void setup() {
+  // Initialisation of ports.
+  pinMode(TWO_TO_FOUR_A_PIN, OUTPUT);
+  pinMode(TWO_TO_FOUR_B_PIN, OUTPUT);
+  pinMode(PUSH_BUTTON, INPUT);
+  pinMode(ULTRASONIC, OUTPUT);
+  pinMode(ULTRASONIC, INPUT);
+  pinMode(INFRARED, INPUT);
+  activateOutputPin(Y3);
+  led.setpin(13);
+
+  Serial.begin(9600);  // Setup serial monitor for debugging purpose.
+}
+
+void toggleStatusIfButtonPushed();
+void strafeIfNearWall();
+
+void loop() {
+  // Check for button push to toggle between mBot status RUNNNING and STOPPED.
+  toggleStatusIfButtonPushed();
+
+  // mBot stops and plays music when mBot status is COMPLETED.
+  if (status == COMPLETED) {
+    // Stop mBot.
+    leftMotor.stop();
+    rightMotor.stop();
+
+    // Play music.
+    celebrate();
+  }
+
+  // Main functions only activated if mBot status is RUNNING.
+  else if (status == RUNNING) {
+    int sensorState = lineFinder.readSensors();  // read the line sensor's state
+
+    // If black line sensed.
+    if (sensorState != S1_OUT_S2_OUT) {
+      // Stop mBot.
+      leftMotor.stop();
+      rightMotor.stop();
+
+      // Solve waypoint challenge.
+      switch (detectColour()) {
+        case C_GREEN:
+          turnRight();
+          break;
+        case C_RED:
+          turnLeft();
+          break;
+        case C_ORANGE:
+          if (getUltrasonicDistance() < 10.7) {
+            turn180Right();
+          } else {
+            turn180Left();
+          }
+          break;
+        case C_PURPLE:
+          turnLeftThenLeft();
+          break;
+        case C_BLUE:
+          turnRightThenRight();
+          break;
+        case C_WHITE:
+          status = COMPLETED;
+          break;
+      }
+      led.setColor(0.0, 0.0, 0.0);
+      led.show();       
+    }
+
+    // If black line not sensed.
+    else if (sensorState == S1_OUT_S2_OUT) {
+      // Move mBot forward.
+      spinLeftWheelForward(MOTOR_SPEED_L);
+      spinRightWheelForward(MOTOR_SPEED_R);
+
+      // Get distance from right wall from infrared subsystem. // TODO: Extract function.
+      int infraredReading = analogRead(INFRARED);
+
+      // Get distance from left wall from ultrasonic sensor.
+      float ultrasonicDistance = getUltrasonicDistance();
+
+      // Check distance of flanking walls, then strafe in correct direction if necessary to stay in center of maze lane.
+      strafeIfNearWall(ultrasonicDistance, infraredReading);
+    }
+  }
+
+  // mBot stops and does nothing when mBot status is STOPPED.
+  else if (status == STOPPED) {
+    // Nothing.
+  }
+}
+
+// Returns distance from left wall from ultrasonic sensor.
+float getUltrasonicDistance() {
+  // 1. Sends ultrasonic pulse.
+  digitalWrite(ULTRASONIC, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC, LOW);
+
+  // 2. Get duration of ultrasonic pulse.
+  long duration = pulseIn(ULTRASONIC, HIGH, TIMEOUT);
+
+  // 3. Calculate distance from left wall from duration.
+  return duration * SPEED_OF_SOUND / 2.0;
+}
+
+// Checks for button push to toggle between mBot status RUNNNING and STOPPED.
+// Called in main loop.
+void toggleStatusIfButtonPushed() {
+  // When button is up, check if push button is pushed.
+  // If so, toggle status from RUNNING to STOPPED or STOPPED to RUNNING.
+  if (!isPushButtonDown && analogRead(PUSH_BUTTON) < 100) {  // If push button is just pushed, the value will drop below 100.
+    status = status == STOPPED ? RUNNING : STOPPED;          // Toggle status.
+    isPushButtonDown = true;                                 // Flags button as down, so
+  }
+
+  // When button is down, check if push button is released.
+  // If so, mark button as up.
+  else if (isPushButtonDown && analogRead(PUSH_BUTTON) >= 100) {
+    isPushButtonDown = false;  // Flags button as up, and check for button pushes.
+  }
+}
+
+// Checks distance of flanking walls, then strafe in correct direction if necessary to stay in center of maze lane.
+// Called in main loop.
+void strafeIfNearWall(float ultrasonicDistance, float infraredReading) {
+  Serial.print("ultrasonic:");
+  Serial.println(ultrasonicDistance);
+  Serial.print("IR:");
+  Serial.println(infraredReading);
+  if (ultrasonicDistance < 7) {  //USS: 10.7, IR:11.25,
+    spinRightWheelForward(MOTOR_SPEED_R - 15);
+    spinLeftWheelForward(MOTOR_SPEED_L + 30);
+    delay(25);
+  } else if (ultrasonicDistance <= 10.0) {
+    spinRightWheelForward(MOTOR_SPEED_R - 10);
+    spinLeftWheelForward(MOTOR_SPEED_L + 15);
+    delay(25);
+  } else if (/* ultrasonicDistance > 15.7 || */ infraredReading < 280) {
+    spinLeftWheelForward(MOTOR_SPEED_L - 25);
+    spinRightWheelForward(MOTOR_SPEED_R + 45);
+    delay(25);
+  } else if (/* ultrasonicDistance > 11.7 || */ infraredReading < 370) {
+    spinLeftWheelForward(MOTOR_SPEED_L - 15);
+    spinRightWheelForward(MOTOR_SPEED_R + 25);
+    delay(25);
+  } 
+}
+
+MeBuzzer buzzer;  // Create the buzzer object
+
+#define NOTE_B0 31
+#define NOTE_C1 33
+#define NOTE_CS1 35
+#define NOTE_D1 37
+#define NOTE_DS1 39
+#define NOTE_E1 41
+#define NOTE_F1 44
+#define NOTE_FS1 46
+#define NOTE_G1 49
+#define NOTE_GS1 52
+#define NOTE_A1 55
+#define NOTE_AS1 58
+#define NOTE_B1 62
+#define NOTE_C2 65
+#define NOTE_CS2 69
+#define NOTE_D2 73
+#define NOTE_DS2 78
+#define NOTE_E2 82
+#define NOTE_F2 87
+#define NOTE_FS2 93
+#define NOTE_G2 98
+#define NOTE_GS2 104
+#define NOTE_A2 110
+#define NOTE_AS2 117
+#define NOTE_B2 123
+#define NOTE_C3 131
+#define NOTE_CS3 139
+#define NOTE_D3 147
+#define NOTE_DS3 156
+#define NOTE_E3 165
+#define NOTE_F3 175
+#define NOTE_FS3 185
+#define NOTE_G3 196
+#define NOTE_GS3 208
+#define NOTE_A3 220
+#define NOTE_AS3 233
+#define NOTE_B3 247
+#define NOTE_C4 262
+#define NOTE_CS4 277
+#define NOTE_D4 294
+#define NOTE_DS4 311
+#define NOTE_E4 330
+#define NOTE_F4 349
+#define NOTE_FS4 370
+#define NOTE_G4 392
+#define NOTE_GS4 415
+#define NOTE_A4 440
+#define NOTE_AS4 466
+#define NOTE_B4 494
+#define NOTE_C5 523
+#define NOTE_CS5 554
+#define NOTE_D5 587
+#define NOTE_DS5 622
+#define NOTE_E5 659
+#define NOTE_F5 698
+#define NOTE_FS5 740
+#define NOTE_G5 784
+#define NOTE_GS5 831
+#define NOTE_A5 880
+#define NOTE_AS5 932
+#define NOTE_B5 988
+#define NOTE_C6 1047
+#define NOTE_CS6 1109
+#define NOTE_D6 1175
+#define NOTE_DS6 1245
+#define NOTE_E6 1319
+#define NOTE_F6 1397
+#define NOTE_FS6 1480
+#define NOTE_G6 1568
+#define NOTE_GS6 1661
+#define NOTE_A6 1760
+#define NOTE_AS6 1865
+#define NOTE_B6 1976
+#define NOTE_C7 2093
+#define NOTE_CS7 2217
+#define NOTE_D7 2349
+#define NOTE_DS7 2489
+#define NOTE_E7 2637
+#define NOTE_F7 2794
+#define NOTE_FS7 2960
+#define NOTE_G7 3136
+#define NOTE_GS7 3322
+#define NOTE_A7 3520
+#define NOTE_AS7 3729
+#define NOTE_B7 3951
+#define NOTE_C8 4186
+#define NOTE_CS8 4435
+#define NOTE_D8 4699
+#define NOTE_DS8 4978
+
+
+//Mario main theme melody
+int melody[] = {
+  NOTE_E7, NOTE_E7, 0, NOTE_E7,
+  0, NOTE_C7, NOTE_E7, 0,
+  NOTE_G7, 0, 0, 0,
+  NOTE_G6, 0, 0, 0,
+
+  NOTE_C7, 0, 0, NOTE_G6,
+  0, 0, NOTE_E6, 0,
+  0, NOTE_A6, 0, NOTE_B6,
+  0, NOTE_AS6, NOTE_A6, 0,
+
+  NOTE_G6, NOTE_E7, NOTE_G7,
+  NOTE_A7, 0, NOTE_F7, NOTE_G7,
+  0, NOTE_E7, 0, NOTE_C7,
+  NOTE_D7, NOTE_B6, 0, 0,
+
+  NOTE_C7, 0, 0, NOTE_G6,
+  0, 0, NOTE_E6, 0,
+  0, NOTE_A6, 0, NOTE_B6,
+  0, NOTE_AS6, NOTE_A6, 0,
+
+  NOTE_G6, NOTE_E7, NOTE_G7,
+  NOTE_A7, 0, NOTE_F7, NOTE_G7,
+  0, NOTE_E7, 0, NOTE_C7,
+  NOTE_D7, NOTE_B6, 0, 0
+};
+
+//Mario main them tempo
+int noteDurations[] = {
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+
+  9,
+  9,
+  9,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+
+  9,
+  9,
+  9,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+  12,
+};
+
+void celebrate() {
+  int size = sizeof(melody) / sizeof(int);
+  for (int thisNote = 0; thisNote < size; thisNote++) {
+
+    // to calculate the note duration, take one second
+    // divided by the note type.
+    //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
+    int noteDuration = 1000 / noteDurations[thisNote];
+    buzzer.tone(melody[thisNote], noteDuration);
+
+    // to distinguish the notes, set a minimum time between them.
+    // the note's duration + 30% seems to work well:
+    int pauseBetweenNotes = noteDuration * 1.30;
+    delay(pauseBetweenNotes);
+    // stop the tone playing:
+    buzzer.noTone();
+  }
+}
